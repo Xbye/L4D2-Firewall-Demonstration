@@ -1,0 +1,214 @@
+#!/sbin/nft -f
+
+flush ruleset
+
+table ip inferno {
+
+    define pSSH = 22
+    define pL4D2 = 27015-27050
+
+    set whitelist {
+        type ipv4_addr
+        #elements = {192.168.1.145}
+        }
+    set blacklist {
+        type ipv4_addr
+        }
+    set service {
+        type ipv4_addr
+        flags interval
+        elements = {XXX}
+        }
+    set testing {
+        type ipv4_addr
+        }
+    set l4d2_blacklist {
+        type ipv4_addr
+        flags dynamic, timeout
+        timeout 10m
+        size 256
+        }
+
+    chain raw_input {
+        type filter hook prerouting priority -300; policy accept;
+        iifname "lo" accept
+        ip protocol tcp ip saddr @whitelist accept
+        ip saddr @testing accept
+        ip saddr @blacklist drop
+        ip saddr @l4d2_blacklist counter goto raw_mal_log
+        ip saddr @service accept
+        udp dport $pL4D2 goto raw_l4d2_server
+        tcp dport $pSSH accept
+        tcp dport 22 counter drop
+        ip protocol icmp drop
+        accept
+        }
+
+    chain raw_mal_log {
+        update @log_malicious_trf {ip saddr and 255.255.255.0}
+        update @l4d2_blacklist {ip saddr and 255.255.255.0}
+        ip saddr and 255.255.255.0 @log_malicious_trf limit rate 20/minute burst 50 packets log group 50
+        drop
+        # meter nf_l4d2_blacklist {ip saddr and 255.255.255.0 timeout 60s limit rate 20/minute burst 50 packets} counter
+        }
+
+    chain raw_l4d2_server {
+        meta length 0-34 goto raw_l4d2_caution
+        meta length 2521-65535 counter goto raw_l4d2_caution
+        meta l4proto udp @ih,0,32 0xFFFFFFFF notrack    # Read RAW PAYLOAD EXPRESSION, important: BITS not BYTES, unlike iptables. (@base,offset,length & mask-value == match-value)
+        meta l4proto udp @ih,0,32 0xFEFFFFFF goto raw_l4d2_caution
+        accept
+        }
+    
+    set log_malicious_trf {
+        type ipv4_addr
+        flags dynamic, timeout
+        timeout 120s
+        size 12
+    }
+
+    chain raw_l4d2_caution {
+        update @log_malicious_trf {ip saddr and 255.255.255.0}
+        ip saddr and 255.255.255.0 @log_malicious_trf limit rate 1/minute burst 10 packets log group 50 counter drop # NEEDS TO BE LOOKED INTO
+        update @l4d2_blacklist {ip saddr} counter
+        drop
+        }
+
+    chain raw_output { # THIS NEEDS TO BE CHECKED
+        type filter hook output priority -300; policy accept;
+        iifname "lo" accept
+        udp sport $pL4D2 goto raw_l4d2_output
+        accept
+    }
+    
+    chain raw_l4d2_output {
+        meta l4proto udp @ih,0,32 0xFFFFFFFF goto raw_l4d2_mark # NEEDS TO BE LOOKED INTO
+        meta l4proto udp @ih,0,32 0xFEFFFFFF notrack # NEEDS TO BE LOOKED INTO
+        accept
+    }
+
+    chain raw_l4d2_mark {
+        meta l4proto udp @ih,32,8 0x70 accept # NEEDS TO BE LOOKED INTO
+        meta l4proto udp @ih,32,8 0x42 accept # NEEDS TO BE LOOKED INTO
+        notrack accept
+    }
+
+##################################################################################################
+
+    chain app_input {
+        type filter hook input priority 0; policy drop;
+        iifname "lo" accept
+        ip protocol tcp ip saddr @whitelist accept
+        ip saddr @service accept
+        ip saddr @testing accept
+        udp dport $pL4D2 goto l4d2_server
+        tcp dport $pSSH accept
+    }
+
+    set est_l4d2_player {
+        type ipv4_addr . inet_service . inet_service
+        flags dynamic, timeout
+        timeout 300s
+        size 128
+    }
+
+    chain l4d2_server {
+        ip saddr . udp sport . udp dport @est_l4d2_player goto l4d2_validated
+        ip saddr and 255.255.0.0 @connect_rate goto l4d2_authenticate
+        meta length 37-108 meta l4proto udp @ih,0,32 0xFFFFFFFF goto l4d2_a2s
+        # update @est_l4d2_player {ip saddr . udp sport . udp dport} counter accept
+        drop
+    }
+
+    set ratelimit {
+        type ipv4_addr . inet_service . inet_service
+        flags dynamic, timeout
+        timeout 30s
+        size 128
+    }
+
+    chain l4d2_validated {
+        # There is a possible issue here with FF
+        update @ratelimit {ip saddr . udp sport . udp dport limit rate 100/second burst 100 packets} counter accept
+        counter drop
+    }
+
+    # ip saddr . udp sport . udp dport @est_l4d2_player limit rate 100/second burst 60 packets accept # This is BAAAAD, GLOBAL SHARED LIMIT
+    # meter validated size 256{ip saddr . udp sport . udp dport timeout 60s limit rate 100/second burst 60 packets} accept
+
+    chain l4d2_a2s {
+        meta length 48-51 meta l4proto udp @ih,32,8 0x71 goto l4d2_begin_connect
+        meta length 108 meta l4proto udp @ih,32,8 0x00 goto l4d2_a2s_limits_steam
+        meta length 53-57 meta l4proto udp @ih,32,8 0x54 goto l4d2_a2s_limits
+        meta length 37 meta l4proto udp @ih,32,8 0x55 goto l4d2_a2s_limits
+        meta length 37 meta l4proto udp @ih,32,8 0x56 goto l4d2_a2s_limits
+        counter drop
+    }
+
+    set connect_rate {
+        type ipv4_addr
+        flags dynamic, timeout
+        timeout 30s
+        size 32
+    }
+
+    chain l4d2_begin_connect {
+        update @connect_rate {ip saddr and 255.255.0.0 limit rate 20/minute burst 10 packets} counter accept
+        counter drop
+    }
+
+    set a2s_rate {
+        type inet_service
+        flags dynamic, timeout
+        timeout 5s
+        size 32
+
+    }
+
+    set a2s_rate_steam {
+        type ipv4_addr . inet_service
+        flags dynamic, timeout
+        timeout 5s
+        size 32
+    }
+
+    chain l4d2_a2s_limits_steam {
+        update @a2s_rate_steam {ip saddr and 255.255.0.0 . udp dport limit rate 20/minute burst 5 packets} accept
+        counter drop
+    }
+
+    chain l4d2_a2s_limits {
+        update @a2s_rate {udp dport limit rate 16/second burst 16 packets} accept
+        counter drop
+    }
+
+    chain l4d2_authenticate {
+        meta l4proto udp @ih,0,32 0xFFFFFFFF update @connect_rate {ip saddr and 255.255.0.0 limit rate 20/minute burst 10 packets} counter accept
+        counter drop
+    }
+    
+
+    chain app_output {
+        type filter hook output priority 0;policy accept;
+        iifname "lo" accept
+        udp sport $pL4D2 goto l4d2_out
+        accept
+    }
+
+    chain l4d2_out {
+        ip daddr . udp dport . udp sport @est_l4d2_player meta l4proto udp @ih,0,32 != 0xFFFFFFFF goto l4d2_out_established
+        meta length 38 meta l4proto udp @ih,0,40 0xFFFFFFFF70 goto l4d2_out_mark
+        meta length 48 meta l4proto udp @ih,0,40 0xFFFFFFFF42 goto l4d2_out_mark
+        accept
+    }
+
+    chain l4d2_out_established {
+        update @est_l4d2_player {ip daddr . udp dport . udp sport} accept
+        counter drop
+    }
+
+    chain l4d2_out_mark {
+        update @est_l4d2_player {ip daddr . udp dport . udp sport} accept
+        counter drop
+    }
+}

@@ -1,0 +1,226 @@
+#!/bin/sh
+
+##--------------------
+iptables -P INPUT ACCEPT
+iptables -P FORWARD ACCEPT
+iptables -P OUTPUT ACCEPT
+iptables -F
+iptables -X
+iptables -t raw -F
+iptables -t raw -X
+ipset destroy   # This will destroy all ipsets, and will cause connection issues if anyone is currently on servers and you remake your firewall
+##--------------------
+
+# Written by Xbye
+# https://steamcommunity.com/profiles/76561198098477111
+
+# This firewall will NOT protect you against legitimate DDOS attacks. You need to have a reliable service provider to shield you
+# from saturation attacks. This firewall is designed for low-bandiwdth DOS attacks that exploit SRCDS and cause it to lag.
+
+# Some other useful information for those interested:
+# Hashlimit module:
+# https://poorlydocumented.com/2017/08/understanding-iptables-hashlimit-module/
+
+# Calculating Subnet masks:
+# http://www.aboutmyip.com/AboutMyXApp/SubnetCalculator.jsp
+
+
+SSH_PORT=""
+L4D2_SERVER_PORTS="27015:27050"
+L4D2_PACKET_RATE="100"
+L4D2_ILLEGAL="0:34 2521:65535"
+
+L4D2_PACKET_BURST=$(($L4D2_PACKET_RATE + 20))
+
+WHITELISTED_IPS=""
+BLACKLISTED_IPS=""
+WEB_WHITELIST_IPS=""
+
+service="XXX"
+
+# IPSET Hashlist Creation
+# https://ipset.netfilter.org/ipset.man.html
+
+    ipset create l4d2_connecting hash:net,port timeout 20 maxelem 256 netmask 16
+    ipset create l4d2_established hash:ip,port timeout 300 maxelem 128
+    ipset create l4d2_blacklist hash:ip timeout 600 maxelem 512 forceadd
+
+    ipset create blacklist hash:ip
+    ipset create whitelist hash:ip
+
+    ipset create testing hash:ip timeout 3600
+
+    ipset create ovh_list hash:net
+    ipset create ssh_logged_in hash:ip timeout 15 maxelem 5
+
+    ipset create web_whitelist hash:ip
+
+    for ip in $WHITELISTED_IPS; do
+        ipset add whitelist $ip
+    done
+
+    for ip in $BLACKLISTED_IPS; do
+        ipset add blacklist $ip
+    done
+
+    for ip in $service; do
+        ipset add ovh_list $ip
+    done
+
+    for ip in $WEB_WHITELIST_IPS; do
+        ipset add web_whitelist $ip
+    done
+
+# TCPDUMP Logging Screens
+# Not necessary unless you want to monitor packets.
+# Make sure these are behind strict rules that prevent your firewall from infinitely writing data.
+# Screen isn't necessary, can use anything that lets a process run in the background detached.
+
+    screen -dmS l4d2_overrate sudo tcpdump -i   nflog:10 -w l4d2_overrate.pcap -U
+    screen -dmS l4d2_established_fail -i        nflog:20 -w l4d2_est_fail.pcap -U
+    screen -dmS l4d2_invalid -i                 nflog:30 -w l4d2_invalid.pcap -U
+    screen -dmS l4d2_a2s_fail -i                nflog:40 -w l4d2_a2s_fail.pcap -U
+    screen -dmS l4d2_malicious -i               nflog:50 -w l4d2_malicious.pcap -U
+
+####################################################################
+# Make Raw Table - Shields Conntrack (prevent conntrack flooding)  #
+# Raw Table drops supposedly faster and uses less resources        #
+# https://blog.cloudflare.com/how-to-drop-10-million-packets/      #
+# Raw tables are access using -t raw                               #
+####################################################################
+
+# Main Tables:
+# PREROUTING (Default: Accept)
+# OUTPUT (Default: Accept)
+
+    iptables -t raw -N l4d2_raw_log_mal
+    iptables -t raw -N l4d2_raw_server
+    iptables -t raw -N l4d2_raw_out
+    iptables -t raw -N l4d2_raw_mark
+    iptables -t raw -N l4d2_caution
+
+    iptables -t raw -A PREROUTING -i lo -j ACCEPT                                            # Allows local traffic within the machine.
+    iptables -t raw -A PREROUTING -p tcp -m set --match-set whitelist src -j ACCEPT          # In case you accidentally lock yourself out of your machine.
+    iptables -t raw -A PREROUTING -m set --match-set testing src -j ACCEPT
+    iptables -t raw -A PREROUTING -m set --match-set blacklist src -j DROP                   # Drop all packets from these IP addresses. Use sparingly.
+    iptables -t raw -A PREROUTING -m set --match-set l4d2_blacklist src -j l4d2_raw_log_mal  # Drop all packets from these IP addresses. Should be automated, and temporary.
+    iptables -t raw -A PREROUTING -m set --match-set ovh_list -j NOTRACK
+    iptables -t raw -A PREROUTING -p udp --dport $L4D2_SERVER_PORTS -j l4d2_raw_server       # All UDP packets targeting these ports will follow this rule
+    iptables -t raw -A PREROUTING -p icmp -j DROP
+    # All packets that don't match the above rules will default to the set -t raw PREROUTING policy: Default is ACCEPT
+
+    iptables -t raw -A OUTPUT -o lo -j ACCEPT                               # Not sure if local output traffic needs conntrack, but there is a lot of it
+    iptables -t raw -A OUTPUT --sport $L4D2_SERVER_PORTS -j l4d2_raw_out
+    # All packets that don't match the above rules will default to the set -t raw OUTPUT policy: Default is ACCEPT
+
+    iptables -t raw -A l4d2_raw_out --sport $L4D2_SERVER_PORTS -m string --algo bm --from 28 --to 32 --hex-string '|FFFFFFFF|' -j l4d2_raw_mark     # Do not waste CONNTRACK resources responding to requests, including connection requests.
+    iptables -t raw -A l4d2_raw_out --sport $L4D2_SERVER_PORTS -m string --algo bm --from 28 --to 32 --hex-string '|FEFFFFFF|' -j NOTRACK     # Do not waste CONNTRACK resources responding to requests.
+    iptables -t raw -A l4d2_raw_out -j ACCEPT
+
+    iptables -t raw -A l4d2_raw_mark -m length --length 38 -m string --algo bm --from 32 --to 33 --hex-string '|70|' -j ACCEPT
+    iptables -t raw -A l4d2_raw_mark -m length --length 48 -m string --algo bm --from 32 --to 33 --hex-string '|42|' -j ACCEPT
+    iptables -t raw -A L4D2_raw_mark -j NO TRACK
+
+    # hashlimit-htable-expire is miliseconds
+    # hashlimit-htable-max amount of entries to track
+    # hashlimit-srcmask "bundles" a range of IP addresses
+
+    iptables -t raw -A l4d2_raw_log_mal -m hashlimit --hashlimit-upto 20/min --hashlimit-burst 50 --hashlimit-name raw_mag_log --hashlimit-mode srcip --hashlimit-srcmask 24 --hashlimit-htable-expire 60000 --hashlimit-htable-max 8 -j NFLOG --nflog-group 50   # Limit logging traffic
+    iptables -t raw -A l4d2_raw_log_mal -j SET --add-set l4d2_blacklist src --exist     # Refreshes the temporary entry in the blacklist.
+    iptables -t raw -A l4d2_raw_log_mal -j DROP
+
+    for packet in $L4D2_ILLEGAL; do
+        iptables -t raw -A l4d2_raw_server -m length --length $packet -j l4d2_caution
+    done
+    iptables -t raw -A l4d2_raw_server -m string --algo bm --from 28 --to 32 --hex-string '|FEFFFFFF|' -j l4d2_caution  # This seems to be related to split packets, which to my knowledge isn't used by legitimate clients.
+    iptables -t raw -A l4d2_raw_server -m string --algo bm --from 28 --to 32 --hex-string '|FFFFFFFF|' -j NOTRACK       # Do not waste CONNTRACK resources on requests or connection attempts. Experimental
+    iptables -t raw -A l4d2_raw_server -j ACCEPT 
+
+    iptables -t raw -A l4d2_caution -m hashlimit --hashlimit-upto 20/min --hashlimit-burst 50 --hashlimit-name raw_mag_log --hashlimit-mode srcip --hashlimit-srcmask 24 --hashlimit-htable-expire 60000 --hashlimit-htable-max 8 -j NFLOG --nflog-group 50
+    iptables -t raw -A l4d2_caution -m hashlimit --hashlimit-upto 1/min --hashlimit-burst 10 --hashlimit-name drop_caution --hashlimit-mode srcip --hashlimit-srcmask 24 --hashlimit-htable-expire 60000 --hashlimit-htable-max 64 -j DROP
+    iptables -t raw -A l4d2_caution -j SET --add-set l4d2_blacklist src
+    iptables -t raw -A l4d2_caution -j DROP
+
+#############################################################################
+# Make Application(?) Table - Default table                                 #
+# Ideal location to be more controlling of packets I believe                #
+#############################################################################
+
+# Main tables:
+# INPUT (Default: Accept)
+# FORWARD (Default: Accept)
+# OUTPUT (Default: Accept)
+
+    iptables -N l4d2_server
+    iptables -N l4d2_out
+    iptables -N l4d2_authenticate
+    iptables -N l4d2_a2s
+    iptables -N l4d2_a2s_limits
+    iptables -N l4d2_begin_connect
+    iptables -N l4d2_mark
+
+    iptables -A INPUT -i lo -j ACCEPT
+    iptables -A INPUT -p tcp -m set --match-set whitelist src -j ACCEPT
+    iptables -A INPUT -m set --match-set ovh_list src -j ACCEPT
+    iptables -A INPUT -m set --match-set testing src -j ACCEPT
+    iptables -A INPUT -p udp --dport $L4D2_SERVER_PORTS -j l4d2_server
+    iptables -A INPUT -p tcp --dport $SSH_PORT -j ACCEPT
+    iptables -A INPUT -p tcp --dport 22 -j DROP
+    
+    iptables -A OUTPUT -o lo -j ACCEPT
+    iptables -A OUTPUT --sport $L4D2_SERVER_PORTS -j l4d2_out
+
+    iptables -A l4d2_server -m set --match-set l4d2_established src,dst -m conntrack --ctstate ESTABLISHED -j l4d2_validated
+    iptables -A l4d2_server -m set --match-set l4d2_connecting src,dst -j l4d2_authenticate
+    iptables -A l4d2_server -m length --length 37:108 -m string --algo bm --from 28 --to 32 --hex-string '|FFFFFFFF|' -j iptables -N l4d2_a2s
+    iptables -A l4d2 server -j DROP
+
+    iptables -A l4d2_validated -m hashlimit --hashlimit-upto ${L4D2_PACKET_RATE} --hashlimit-burst ${L4D2_PACKET_BURST} --hashlimit-name l4d2_maxrate --hashlimit-mode srcip,srcport,dstport --hashlimit-htable-max 256 --hashlimit-htable-expire 10000 -j ACCEPT
+    iptables -A l4d2_validated -j DROP
+
+    iptables -A l4d2_authenticate -m hashlimit --hashlimit-upto 5/s --hashlimit-burst 15 --hashlimit-name auth_l4d2_ff --hashlimit-mode srcip --hashlimit-srcmask 24 --hashlimit-htable-expire 10000 -m string --algo bm --from 28 --to 32 --hex-string '|FFFFFFFF|' -j ACCEPT
+    iptables -A l4d2_authenticate -m set --match-set l4d2_established src,dst -m conntrack --ctstate ESTABLISHED -j l4d2_validated
+    iptables -A l4d2_authenticate -j DROP
+
+    iptables -A l4d2_a2s -m length 48:51 -m string --algo bm --from 32 --to 33 --hex-string '|71|' -j l4d2_begin_connect
+    iptables -A l4d2_a2s -m length 108 -m string --algo bm --from 32 --to 33 --hex-string '|00|' -j l4d2_a2s_limits     # I believe clients using some modified files (speedrunners) send slightly different packets than this
+    iptables -A l4d2_a2s -m length 53:57 -m string --algo bm --from 32 --to 33 --hex-string '|54|' -j l4d2_a2s_limits
+    iptables -A l4d2_a2s -m length 37 -m string --algo bm --from 32 --to 33 --hex-string '|55|' -j l4d2_a2s_limits
+    iptables -A l4d2_a2s -m length 37 -m string --algo bm --from 32 --to 33 --hex-string '|56|' -j l4d2_a2s_limits
+    iptables -A l4d2_a2s -j DROP
+
+    iptables -A l4d2_begin_connect -m hashlimit --hashlimit-upto 8/s --hashlimit-burst 8 --hashlimit-mode srcip --hashlimit-srcmask 16 --hashlimit-name l4d2_connect_attempt --hashlimit-htable-max 64 --hashlimit-htable-expire 10000 -j l4d2_mark
+    iptables -A l4d2_begin_connect -j DROP
+
+    iptables -A l4d2_mark -j SET --add-set l4d2_connecting src,dst --exist
+    iptables -A l4d2_mark -m set ! --match-set l4d2_connecting -j DROP
+    iptables -A l4d2_mark -j ACCEPT
+
+    iptables -A l4d2_a2s_limits -m hashlimit --hashlimit-upto 16/s --hashlimit-burst 32 --hashlimit-mode dstport --hashlimit-htable-expire 5000 -j ACCEPT
+    iptables -A l4d2_a2s_limits -j DROP
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
